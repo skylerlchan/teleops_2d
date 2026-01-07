@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Teleop Pincher – Snap-Assisted Start → End with Gravity</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #05070a;
+      color: #eee;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.7);
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      max-width: 380px;
+      z-index: 10;
+    }
+    #info strong {
+      font-size: 14px;
+    }
+    #status {
+      margin-top: 6px;
+    }
+    .ok { color: #66ff99; }
+    .error { color: #ff6666; }
+    .neutral { color: #cccccc; }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div><strong>Teleop Pincher – Snap-Assisted Start → End</strong></div>
+    <div style="margin-top:4px;">
+      Left: <b>Virtual World</b> – move the pincher with your mouse, click to grab, release to drop.<br>
+      Right: <b>Robot World</b> – robot pincher + box try to copy with delay + slip.<br><br>
+      <b>Task:</b> Pick up the tiny box from the <b>START</b> pad, lift it against gravity, and drop it near the tiny <b>END</b> pad.<br>
+      If you release close enough, a local controller <b>auto-snaps</b> the box into the END pad. The robot does the same if it is also close enough when your drop command arrives.<br><br>
+      Press <b>P</b> to <b>pause/resume</b>. While paused, drag boxes to rearrange the scene.
+    </div>
+    <div id="status" class="neutral" style="margin-top:8px;">
+      Move on the left. Click to grab from START, release near END to let snap-assist take over. Press P to pause/rearrange.
+    </div>
+    <div id="metrics" style="margin-top:6px; font-size:12px;">
+      Robot successful assisted drops (when you also succeed): <span id="successCount">0</span><br>
+      Robot misses (you placed successfully, robot didn't): <span id="missCount">0</span><br>
+      Current position error: <span id="errDist">0</span> px<br>
+      Sim state: <span id="simState">Running</span>
+    </div>
+    <div style="margin-top:6px; font-size:11px; opacity:0.8;">
+      (Tweak LATENCY_MS, FAILURE_PROB, CAPTURE_SCALE, SNAP_DURATION_MS in the script.)
+    </div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const successEl = document.getElementById("successCount");
+    const missEl = document.getElementById("missCount");
+    const errEl = document.getElementById("errDist");
+    const simStateEl = document.getElementById("simState");
+
+    let panelWidth = 0;
+    let panelHeight = 0;
+    let floorY = 0;
+
+    // ---- Teleop parameters ----
+    const LATENCY_MS           = 250;   // simulated network delay
+    const FAILURE_PROB         = 0.12;  // probability robot ignores a move command
+    const ERROR_THRESHOLD      = 60;    // px considered "high error"
+    const NORMAL_FOLLOW_SPEED  = 0.12;  // robot follow smoothing
+    const CATCHUP_SPEED        = 0.22;  // when error is big
+    const PINCHER_LENGTH       = 46;
+    const PINCHER_OPEN_GAP     = 24;
+    const PINCHER_CLOSED_GAP   = 6;
+    const CLOSING_DURATION_MS  = 120;
+
+    // Box & pad
+    const BOX_SIZE             = 14;
+    const ATTACH_OFFSET        = PINCHER_LENGTH / 2 + BOX_SIZE / 2 + 4;
+    const PAD_SIZE             = 24;
+
+    // Gravity
+    const GRAVITY              = 0.5;
+
+    // Snap-assist parameters
+    const CAPTURE_SCALE        = 2.0;   // capture region ~2x pad size
+    const SNAP_DURATION_MS     = 250;   // ms to auto-snap into place
+
+    // Pad placement (fractions within panel)
+    const startPadConfig = {
+      xFrac: 0.3,
+      yFrac: 0.6
+    };
+    const endPadConfig = {
+      xFrac: 0.7,
+      yFrac: 0.4
+    };
+
+    function getPadGeom(isVirtual, isStart) {
+      const cfg = isStart ? startPadConfig : endPadConfig;
+      const baseX = isVirtual ? 0 : panelWidth;
+      const cx = baseX + panelWidth * cfg.xFrac;
+      const cy = panelHeight * cfg.yFrac;
+      const half = PAD_SIZE / 2;
+      return { x: cx - half, y: cy - half, w: PAD_SIZE, h: PAD_SIZE };
+    }
+
+    // ---- Grippers ----
+    let virtualGripper = {
+      x: 0,
+      y: 0,
+      state: "open",     // "open" | "closing" | "closed"
+      closingUntil: 0
+    };
+
+    let robotGripper = {
+      x: 0,
+      y: 0,
+      targetX: 0,
+      targetY: 0,
+      state: "open",
+      closingUntil: 0
+    };
+
+    // ---- Boxes ----
+    let virtualBox = {
+      x: 0,
+      y: 0,
+      size: BOX_SIZE,
+      held: false,
+      vy: 0
+    };
+
+    let robotBox = {
+      x: 0,
+      y: 0,
+      size: BOX_SIZE,
+      held: false,
+      vy: 0
+    };
+
+    // Snap state for auto-placement
+    let virtualSnap = {
+      active: false,
+      t0: 0,
+      t1: 0,
+      startX: 0,
+      startY: 0,
+      endX: 0,
+      endY: 0
+    };
+
+    let robotSnap = {
+      active: false,
+      t0: 0,
+      t1: 0,
+      startX: 0,
+      startY: 0,
+      endX: 0,
+      endY: 0
+    };
+
+    // Command queues
+    const moveQueue = [];   // for robot position updates
+    const actionQueue = []; // for "close" and "open" (drop) events
+
+    // Metrics and state
+    let virtualHasObject = false;
+    let robotHasObject   = false;
+    let successes = 0;
+    let misses = 0;
+    let paused = false;
+
+    // Manual box-dragging while paused
+    let draggingVirtualBoxManual = false;
+    let draggingRobotBoxManual = false;
+    let boxDragOffsetX = 0;
+    let boxDragOffsetY = 0;
+
+    // ---- Helpers ----
+    function distance(x1, y1, x2, y2) {
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      return Math.hypot(dx, dy);
+    }
+
+    function isPointInBox(box, x, y) {
+      const half = box.size / 2;
+      return (
+        x >= box.x - half &&
+        x <= box.x + half &&
+        y >= box.y - half &&
+        y <= box.y + half
+      );
+    }
+
+    function isBoxInPad(box, padGeom) {
+      const half = box.size / 2;
+      return (
+        box.x - half >= padGeom.x &&
+        box.x + half <= padGeom.x + padGeom.w &&
+        box.y - half >= padGeom.y &&
+        box.y + half <= padGeom.y + padGeom.h
+      );
+    }
+
+    function isBoxInCaptureRegion(box, padGeom) {
+      const cx = padGeom.x + padGeom.w / 2;
+      const cy = padGeom.y + padGeom.h / 2;
+      const half = (padGeom.w * CAPTURE_SCALE) / 2;
+      return (
+        box.x >= cx - half &&
+        box.x <= cx + half &&
+        box.y >= cy - half &&
+        box.y <= cy + half
+      );
+    }
+
+    function applyGravityAndFloor(box) {
+      if (box.held) {
+        box.vy = 0;
+        return;
+      }
+      box.vy += GRAVITY;
+      box.y += box.vy;
+
+      const half = box.size / 2;
+      const bottom = box.y + half;
+      if (bottom >= floorY) {
+        box.y = floorY - half;
+        box.vy = 0;
+      }
+    }
+
+    function updateSnap(snap, box, now) {
+      if (!snap.active) return;
+      const { t0, t1, startX, startY, endX, endY } = snap;
+      const denom = t1 - t0;
+      let alpha = denom <= 0 ? 1 : (now - t0) / denom;
+      if (alpha >= 1) {
+        alpha = 1;
+        snap.active = false;
+      }
+      box.x = startX + (endX - startX) * alpha;
+      box.y = startY + (endY - startY) * alpha;
+      box.vy = 0;
+    }
+
+    function resetScene() {
+      panelWidth = canvas.width / 2;
+      panelHeight = canvas.height;
+
+      floorY = panelHeight * 0.85;
+
+      // Virtual gripper starting pos
+      virtualGripper.x = panelWidth * 0.25;
+      virtualGripper.y = panelHeight * 0.4;
+      virtualGripper.state = "open";
+      virtualGripper.closingUntil = 0;
+
+      // Robot gripper starting pos
+      robotGripper.x = panelWidth * 0.25 + panelWidth;
+      robotGripper.y = panelHeight * 0.4;
+      robotGripper.targetX = robotGripper.x;
+      robotGripper.targetY = robotGripper.y;
+      robotGripper.state = "open";
+      robotGripper.closingUntil = 0;
+
+      // Place boxes exactly on start pads
+      const vStartPad = getPadGeom(true, true);
+      virtualBox.x = vStartPad.x + vStartPad.w / 2;
+      virtualBox.y = vStartPad.y + vStartPad.h / 2;
+      virtualBox.held = false;
+      virtualBox.vy = 0;
+
+      const rStartPad = getPadGeom(false, true);
+      robotBox.x = rStartPad.x + rStartPad.w / 2;
+      robotBox.y = rStartPad.y + rStartPad.h / 2;
+      robotBox.held = false;
+      robotBox.vy = 0;
+
+      virtualHasObject = false;
+      robotHasObject = false;
+
+      moveQueue.length = 0;
+      actionQueue.length = 0;
+
+      virtualSnap.active = false;
+      robotSnap.active = false;
+    }
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      resetScene();
+    }
+
+    window.addEventListener("resize", resize);
+    resize();
+
+    function setPaused(val) {
+      paused = val;
+      simStateEl.textContent = paused ? "Paused" : "Running";
+      if (paused) {
+        statusEl.textContent =
+          "Paused. Drag boxes on either side to rearrange. Press P to resume.";
+        statusEl.className = "neutral";
+        moveQueue.length = 0;
+        actionQueue.length = 0;
+      } else {
+        statusEl.textContent =
+          "Running. Grab from START, drop near END to let snap-assist finish. Press P to pause.";
+        statusEl.className = "neutral";
+      }
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "p" || e.key === "P") {
+        setPaused(!paused);
+      }
+    });
+
+    // ---- Mouse control ----
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      if (paused) {
+        // Drag boxes while paused
+        if (mx <= panelWidth && isPointInBox(virtualBox, mx, my)) {
+          draggingVirtualBoxManual = true;
+          boxDragOffsetX = virtualBox.x - mx;
+          boxDragOffsetY = virtualBox.y - my;
+        } else if (mx > panelWidth && isPointInBox(robotBox, mx, my)) {
+          draggingRobotBoxManual = true;
+          boxDragOffsetX = robotBox.x - mx;
+          boxDragOffsetY = robotBox.y - my;
+        }
+        return;
+      }
+
+      if (mx <= panelWidth) {
+        const now = performance.now();
+
+        virtualGripper.state = "closing";
+        virtualGripper.closingUntil = now + CLOSING_DURATION_MS;
+
+        // More realistic: grab only when above top of box and aligned horizontally
+        const dx = Math.abs(virtualGripper.x - virtualBox.x);
+        const dy = virtualGripper.y - virtualBox.y; // negative if above
+        const horizontalTolerance = BOX_SIZE * 0.6;
+        const verticalToleranceTop = BOX_SIZE * 0.8;
+
+        if (
+          !virtualHasObject &&
+          dx <= horizontalTolerance &&
+          dy <= 0 &&
+          Math.abs(dy) <= verticalToleranceTop
+        ) {
+          virtualHasObject = true;
+          virtualBox.held = true;
+          virtualBox.x = virtualGripper.x;
+          virtualBox.y = virtualGripper.y + ATTACH_OFFSET;
+          virtualBox.vy = 0;
+          virtualSnap.active = false; // cancel any prior snap
+        }
+
+        actionQueue.push({
+          time: now,
+          type: "close",
+          virtualPicked: virtualHasObject
+        });
+
+        statusEl.textContent =
+          "Closing in virtual world… robot will attempt to grab after latency.";
+        statusEl.className = "neutral";
+      }
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      if (paused) {
+        if (draggingVirtualBoxManual) {
+          virtualBox.x = mx + boxDragOffsetX;
+          virtualBox.y = my + boxDragOffsetY;
+        } else if (draggingRobotBoxManual) {
+          robotBox.x = mx + boxDragOffsetX;
+          robotBox.y = my + boxDragOffsetY;
+        }
+        return;
+      }
+
+      if (mx <= panelWidth) {
+        virtualGripper.x = mx;
+        virtualGripper.y = my;
+
+        if (virtualHasObject) {
+          virtualBox.x = virtualGripper.x;
+          virtualBox.y = virtualGripper.y + ATTACH_OFFSET;
+          virtualBox.vy = 0;
+          virtualSnap.active = false;
+        }
+
+        const robotTargetX = mx + panelWidth;
+        const robotTargetY = my;
+        moveQueue.push({
+          time: performance.now(),
+          x: robotTargetX,
+          y: robotTargetY
+        });
+      }
+    });
+
+    canvas.addEventListener("mouseup", () => {
+      if (paused) {
+        draggingVirtualBoxManual = false;
+        draggingRobotBoxManual = false;
+        return;
+      }
+
+      const now = performance.now();
+
+      const priorVirtualHad = virtualHasObject;
+      const virtualEndPad = getPadGeom(true, false);
+
+      let virtualDropSuccess = false;
+
+      if (priorVirtualHad) {
+        // Check if within capture region; if so, engage snap assist
+        if (isBoxInCaptureRegion(virtualBox, virtualEndPad)) {
+          const endCx = virtualEndPad.x + virtualEndPad.w / 2;
+          const endCy = virtualEndPad.y + virtualEndPad.h / 2;
+
+          virtualSnap.active = true;
+          virtualSnap.t0 = now;
+          virtualSnap.t1 = now + SNAP_DURATION_MS;
+          virtualSnap.startX = virtualBox.x;
+          virtualSnap.startY = virtualBox.y;
+          virtualSnap.endX = endCx;
+          virtualSnap.endY = endCy;
+
+          virtualDropSuccess = true;
+          statusEl.textContent =
+            "Snap-assist engaged in virtual world. Waiting to see if the robot also snaps in.";
+          statusEl.className = "neutral";
+        } else {
+          statusEl.textContent =
+            "You dropped the box outside the capture region. It will fall.";
+          statusEl.className = "neutral";
+        }
+      }
+
+      virtualHasObject = false;
+      virtualBox.held = false;
+      virtualGripper.state = "open";
+      virtualGripper.closingUntil = 0;
+
+      actionQueue.push({
+        time: now,
+        type: "open",
+        virtualDropSuccess: virtualDropSuccess
+      });
+    });
+
+    canvas.addEventListener("mouseleave", () => {
+      draggingVirtualBoxManual = false;
+      draggingRobotBoxManual = false;
+    });
+
+    // ---- Main loop ----
+    function step() {
+      const now = performance.now();
+
+      if (!paused) {
+        // Update gripper animations
+        if (virtualGripper.state === "closing" && now >= virtualGripper.closingUntil) {
+          virtualGripper.state = "closed";
+        }
+        if (robotGripper.state === "closing" && now >= robotGripper.closingUntil) {
+          robotGripper.state = "closed";
+        }
+
+        // Robot move commands with latency
+        let cmd = null;
+        while (moveQueue.length > 0 && now - moveQueue[0].time >= LATENCY_MS) {
+          cmd = moveQueue.shift();
+        }
+        if (cmd) {
+          if (Math.random() > FAILURE_PROB) {
+            robotGripper.targetX = cmd.x;
+            robotGripper.targetY = cmd.y;
+          }
+        }
+
+        // Robot actions with latency
+        while (actionQueue.length > 0 && now - actionQueue[0].time >= LATENCY_MS) {
+          const act = actionQueue.shift();
+          if (act.type === "close") {
+            robotGripper.state = "closing";
+            robotGripper.closingUntil = now + CLOSING_DURATION_MS;
+
+            // Similar top-of-box grab logic for robot
+            const dxR = Math.abs(robotGripper.x - robotBox.x);
+            const dyR = robotGripper.y - robotBox.y;
+            const horizontalToleranceR = BOX_SIZE * 0.6;
+            const verticalToleranceTopR = BOX_SIZE * 0.8;
+
+            if (
+              !robotHasObject &&
+              dxR <= horizontalToleranceR &&
+              dyR <= 0 &&
+              Math.abs(dyR) <= verticalToleranceTopR
+            ) {
+              robotHasObject = true;
+              robotBox.held = true;
+              robotBox.x = robotGripper.x;
+              robotBox.y = robotGripper.y + ATTACH_OFFSET;
+              robotBox.vy = 0;
+              robotSnap.active = false;
+            }
+          } else if (act.type === "open") {
+            const priorRobotHad = robotHasObject;
+
+            robotGripper.state = "open";
+            robotGripper.closingUntil = 0;
+            robotHasObject = false;
+            robotBox.held = false;
+
+            const robotEndPad = getPadGeom(false, false);
+            let robotDropSuccess = false;
+
+            if (priorRobotHad && act.virtualDropSuccess) {
+              // Only attempt snap-assist on robot side if YOU succeeded virtually
+              if (isBoxInCaptureRegion(robotBox, robotEndPad)) {
+                const endCx = robotEndPad.x + robotEndPad.w / 2;
+                const endCy = robotEndPad.y + robotEndPad.h / 2;
+
+                robotSnap.active = true;
+                robotSnap.t0 = now;
+                robotSnap.t1 = now + SNAP_DURATION_MS;
+                robotSnap.startX = robotBox.x;
+                robotSnap.startY = robotBox.y;
+                robotSnap.endX = endCx;
+                robotSnap.endY = endCy;
+
+                robotDropSuccess = true;
+              }
+            }
+
+            if (act.virtualDropSuccess) {
+              if (robotDropSuccess) {
+                successes++;
+                successEl.textContent = successes;
+                statusEl.textContent =
+                  "✅ Snap-assist worked in both worlds. Robot also snapped into END.";
+                statusEl.className = "ok";
+              } else {
+                misses++;
+                missEl.textContent = misses;
+                statusEl.textContent =
+                  "❌ Virtual snap succeeded, but robot wasn't close enough to snap. It missed.";
+                statusEl.className = "error";
+              }
+            }
+          }
+        }
+
+        // Robot motion toward target
+        const dxTarget = robotGripper.targetX - robotGripper.x;
+        const dyTarget = robotGripper.targetY - robotGripper.y;
+
+        const desiredRobotX = virtualGripper.x + panelWidth;
+        const desiredRobotY = virtualGripper.y;
+        const dxErr = desiredRobotX - robotGripper.x;
+        const dyErr = desiredRobotY - robotGripper.y;
+        const errorDist = Math.hypot(dxErr, dyErr);
+        errEl.textContent = errorDist.toFixed(1);
+
+        const speed = errorDist > ERROR_THRESHOLD ? CATCHUP_SPEED : NORMAL_FOLLOW_SPEED;
+        robotGripper.x += dxTarget * speed;
+        robotGripper.y += dyTarget * speed;
+
+        // Attach boxes when held
+        if (virtualHasObject) {
+          virtualBox.x = virtualGripper.x;
+          virtualBox.y = virtualGripper.y + ATTACH_OFFSET;
+          virtualBox.vy = 0;
+          virtualSnap.active = false;
+        }
+
+        if (robotHasObject) {
+          robotBox.x = robotGripper.x;
+          robotBox.y = robotGripper.y + ATTACH_OFFSET;
+          robotBox.vy = 0;
+          robotSnap.active = false;
+        }
+
+        // Snap animations
+        updateSnap(virtualSnap, virtualBox, now);
+        updateSnap(robotSnap, robotBox, now);
+
+        // Gravity & floor for free boxes (not snapping)
+        if (!virtualSnap.active) {
+          applyGravityAndFloor(virtualBox);
+        }
+        if (!robotSnap.active) {
+          applyGravityAndFloor(robotBox);
+        }
+      }
+
+      draw();
+      requestAnimationFrame(step);
+    }
+
+    // ---- Drawing helpers ----
+    function drawPincher(gripper, color) {
+      const gap = gripper.state === "closed" ? PINCHER_CLOSED_GAP : PINCHER_OPEN_GAP;
+      const halfLength = PINCHER_LENGTH / 2;
+      const jawThickness = 6;
+
+      // Base "wrist" circle
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.arc(gripper.x, gripper.y - 24, 9, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Vertical arm
+      ctx.beginPath();
+      ctx.moveTo(gripper.x, gripper.y - 15);
+      ctx.lineTo(gripper.x, gripper.y - 2);
+      ctx.stroke();
+
+      // Jaws
+      ctx.fillStyle = color;
+      ctx.fillRect(
+        gripper.x - halfLength - 4,
+        gripper.y - gap / 2 - jawThickness / 2,
+        halfLength,
+        jawThickness
+      );
+      ctx.fillRect(
+        gripper.x + 4,
+        gripper.y - gap / 2 - jawThickness / 2,
+        halfLength,
+        jawThickness
+      );
+
+      // Pads
+      const padLength = 10;
+      ctx.fillStyle = "#111";
+      ctx.fillRect(
+        gripper.x - halfLength - 4,
+        gripper.y - gap / 2 - jawThickness / 2,
+        padLength,
+        jawThickness
+      );
+      ctx.fillRect(
+        gripper.x + 4 + halfLength - padLength,
+        gripper.y - gap / 2 - jawThickness / 2,
+        padLength,
+        jawThickness
+      );
+
+      // Center point
+      ctx.beginPath();
+      ctx.arc(gripper.x, gripper.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    function drawBox(box, color) {
+      const half = box.size / 2;
+      ctx.fillStyle = color;
+      ctx.fillRect(box.x - half, box.y - half, box.size, box.size);
+      ctx.strokeStyle = "#111";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(box.x - half, box.y - half, box.size, box.size);
+    }
+
+    function drawPad(padGeom, isVirtual, isStart) {
+      const borderColor = isVirtual
+        ? "rgba(0, 200, 255, 0.9)"
+        : "rgba(0, 255, 128, 0.9)";
+
+      const fillColor = isVirtual
+        ? (isStart ? "rgba(0, 200, 255, 0.08)" : "rgba(0, 200, 255, 0.12)")
+        : (isStart ? "rgba(0, 255, 128, 0.08)" : "rgba(0, 255, 128, 0.12)");
+
+      ctx.fillStyle = fillColor;
+      ctx.fillRect(padGeom.x, padGeom.y, padGeom.w, padGeom.h);
+
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(padGeom.x, padGeom.y, padGeom.w, padGeom.h);
+
+      ctx.fillStyle = "#cccccc";
+      ctx.font = "11px system-ui";
+      const label = isStart ? "START" : "END";
+      ctx.fillText(label, padGeom.x + 3, padGeom.y - 4);
+
+      // Optional: draw capture region outline to visualize assist
+      if (!isStart) {
+        const cx = padGeom.x + padGeom.w / 2;
+        const cy = padGeom.y + padGeom.h / 2;
+        const half = (padGeom.w * CAPTURE_SCALE) / 2;
+        ctx.strokeStyle = isVirtual
+          ? "rgba(0, 200, 255, 0.2)"
+          : "rgba(0, 255, 128, 0.2)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(cx - half, cy - half, half * 2, half * 2);
+        ctx.setLineDash([]);
+      }
+    }
+
+    function drawEndSignal(padGeom, inPad) {
+      if (!inPad) return;
+      const cx = padGeom.x + padGeom.w / 2;
+      const cy = padGeom.y + padGeom.h / 2;
+
+      // Glow circle
+      ctx.beginPath();
+      ctx.arc(cx, cy, padGeom.w * 0.6, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0, 255, 140, 0.25)";
+      ctx.fill();
+
+      // Border highlight
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(0, 255, 140, 0.9)";
+      ctx.strokeRect(padGeom.x - 2, padGeom.y - 2, padGeom.w + 4, padGeom.h + 4);
+
+      // Checkmark
+      ctx.strokeStyle = "#00ff99";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx - 5, cy + 1);
+      ctx.lineTo(cx - 1, cy + 6);
+      ctx.lineTo(cx + 6, cy - 4);
+      ctx.stroke();
+    }
+
+    function drawEndStatusText(vInEnd, rInEnd, width) {
+      const y = 18;
+      ctx.font = "12px system-ui";
+
+      // Virtual
+      ctx.fillStyle = vInEnd ? "#00ff99" : "#888888";
+      ctx.fillText(
+        "Virtual END: " + (vInEnd ? "IN" : "OUT"),
+        width * 0.18,
+        y
+      );
+
+      // Robot
+      ctx.fillStyle = rInEnd ? "#00ff99" : "#888888";
+      ctx.fillText(
+        "Robot END: " + (rInEnd ? "IN" : "OUT"),
+        width * 0.6,
+        y
+      );
+    }
+
+    function draw() {
+      const width = canvas.width;
+      const height = canvas.height;
+      const midX = width / 2;
+
+      // Background
+      const grd = ctx.createLinearGradient(0, 0, width, height);
+      grd.addColorStop(0, "#060913");
+      grd.addColorStop(1, "#020308");
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, 0, width, height);
+
+      // Divider
+      ctx.strokeStyle = "rgba(255,255,255,0.25)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(midX, 0);
+      ctx.lineTo(midX, height);
+      ctx.stroke();
+
+      // Floor
+      ctx.strokeStyle = "rgba(255,255,255,0.2)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, floorY);
+      ctx.lineTo(width, floorY);
+      ctx.stroke();
+
+      // Labels
+      ctx.fillStyle = "#bbbbbb";
+      ctx.font = "14px system-ui";
+      ctx.fillText("VIRTUAL WORLD", midX * 0.1, 36);
+      ctx.fillText("ROBOT WORLD", midX + midX * 0.1, 36);
+
+      // Pads
+      const vStartPad = getPadGeom(true, true);
+      const vEndPad   = getPadGeom(true, false);
+      const rStartPad = getPadGeom(false, true);
+      const rEndPad   = getPadGeom(false, false);
+
+      drawPad(vStartPad, true, true);
+      drawPad(vEndPad, true, false);
+      drawPad(rStartPad, false, true);
+      drawPad(rEndPad, false, false);
+
+      // Boxes
+      drawBox(virtualBox, "#4da6ff");
+      drawBox(robotBox, "#ff4d4d");
+
+      // Grippers
+      drawPincher(virtualGripper, "#4da6ff");
+      drawPincher(robotGripper, "#ff4d4d");
+
+      // END pad “in” status
+      const vInEnd = isBoxInPad(virtualBox, vEndPad);
+      const rInEnd = isBoxInPad(robotBox, rEndPad);
+
+      drawEndSignal(vEndPad, vInEnd);
+      drawEndSignal(rEndPad, rInEnd);
+      drawEndStatusText(vInEnd, rInEnd, width);
+
+      if (paused) {
+        ctx.fillStyle = "rgba(0,0,0,0.35)";
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "20px system-ui";
+        ctx.fillText(
+          "PAUSED – drag boxes to rearrange, press P to resume",
+          width / 2 - 230,
+          height / 2
+        );
+      }
+    }
+
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>
